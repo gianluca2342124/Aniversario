@@ -1,0 +1,41 @@
+{
+  "$schema": "./node_modules/wrangler/config-schema.json",
+  "name": "santi-claudia-fotos",
+  "main": "./worker/index.ts",
+  "compatibility_date": "2026-05-22",
+  "workers_dev": true,
+  "observability": {
+    "enabled": true
+  },
+  "assets": {
+    "binding": "ASSETS",
+    "not_found_handling": "single-page-application",
+    "run_worker_first": [
+      "/",
+      "/api/*",
+      "/admin",
+      "/admin/*"
+    ]
+  },
+  "r2_buckets": [
+    {
+      "binding": "PHOTOS",
+      "bucket_name": "santi-claudia-photos"
+    }
+  ],
+  "ratelimits": [
+    {
+      "name": "UPLOAD_RATE_LIMITER",
+      "namespace_id": "749201631",
+      "simple": {
+        "limit": 40,
+        "period": 60
+      }
+    }
+  ],
+  "secrets": {
+    "required": [
+      "ADMIN_PASSWORD"
+    ]
+  }
+}

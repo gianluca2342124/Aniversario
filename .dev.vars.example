@@ -1,0 +1,3 @@
+# Copia este archivo como .dev.vars para desarrollar en local.
+# En producción usa: npx wrangler secret put ADMIN_PASSWORD
+ADMIN_PASSWORD="cambia-esta-contrasena"
