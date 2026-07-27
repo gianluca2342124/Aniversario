@@ -128,11 +128,19 @@ main {
 
 .hero {
   display: flex;
+  width: min(100%, 820px);
   min-height: 290px;
+  padding: clamp(28px, 5vw, 46px) clamp(16px, 5vw, 44px);
+  border: 1px solid rgba(65, 80, 55, 0.14);
+  border-radius: clamp(28px, 5vw, 42px);
+  margin: 0 auto;
   flex-direction: column;
   align-items: center;
   justify-content: center;
+  background: rgba(251, 248, 239, 0.88);
+  box-shadow: 0 14px 46px rgba(55, 64, 43, 0.1);
   text-align: center;
+  backdrop-filter: blur(12px);
   animation: rise-in 700ms ease-out both;
 }
 
