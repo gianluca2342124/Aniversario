@@ -1,5 +1,5 @@
 /*
   X-Content-Type-Options: nosniff
   Referrer-Policy: same-origin
-  Permissions-Policy: geolocation=(), microphone=(), payment=(), usb=()
+  Permissions-Policy: geolocation=(), camera=(self), microphone=(self), payment=(), usb=()
   Content-Security-Policy: default-src 'self'; img-src 'self' data: blob:; script-src 'self'; style-src 'self' 'unsafe-inline'; connect-src 'self'; base-uri 'none'; frame-ancestors 'none'; form-action 'self'

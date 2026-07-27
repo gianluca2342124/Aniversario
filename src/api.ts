@@ -1,4 +1,10 @@
-import type { PhotosResponse, UploadResponse } from "./types";
+import type {
+  CompleteUploadResponse,
+  CreateUploadResponse,
+  MediaResponse,
+  UploadedPart,
+  UploadSessionResponse,
+} from "./types";
 
 async function responseError(response: Response): Promise<string> {
   try {
@@ -10,40 +16,98 @@ async function responseError(response: Response): Promise<string> {
   return `No se pudo completar la solicitud (${response.status}).`;
 }
 
-export async function getPhotos(
+async function jsonRequest<T>(
+  url: string,
+  init: RequestInit = {},
+): Promise<T> {
+  const response = await fetch(url, {
+    credentials: "same-origin",
+    ...init,
+    headers: {
+      "content-type": "application/json",
+      ...init.headers,
+    },
+  });
+  if (!response.ok) throw new Error(await responseError(response));
+  return response.json() as Promise<T>;
+}
+
+export async function getMedia(
   cursor?: string,
   admin = false,
-): Promise<PhotosResponse> {
+): Promise<MediaResponse> {
   const params = new URLSearchParams({ limit: "24" });
   if (cursor) params.set("cursor", cursor);
-  const endpoint = admin ? "/api/admin/photos" : "/api/photos";
+  const endpoint = admin ? "/api/admin/media" : "/api/media";
   const response = await fetch(`${endpoint}?${params}`, {
     credentials: "same-origin",
     cache: "no-store",
   });
   if (!response.ok) throw new Error(await responseError(response));
-  return response.json() as Promise<PhotosResponse>;
+  return response.json() as Promise<MediaResponse>;
 }
 
-export function uploadPhoto(
-  file: File,
-  onProgress: (fraction: number) => void,
-): Promise<UploadResponse> {
+export function createUploadSession(): Promise<UploadSessionResponse> {
+  return jsonRequest("/api/uploads/session", { method: "POST", body: "{}" });
+}
+
+export function createMultipartUpload(
+  payload: {
+    name: string;
+    type: string;
+    size: number;
+    kind: "image" | "video";
+    signature: string;
+    fingerprint: string;
+  },
+  token: string,
+): Promise<CreateUploadResponse> {
+  return jsonRequest("/api/uploads/create", {
+    method: "POST",
+    headers: { "x-upload-token": token },
+    body: JSON.stringify(payload),
+  });
+}
+
+export function uploadPart(
+  upload: { key: string; uploadId: string },
+  partNumber: number,
+  chunk: Blob,
+  token: string,
+  signal: AbortSignal,
+  onProgress: (loaded: number) => void,
+): Promise<UploadedPart> {
   return new Promise((resolve, reject) => {
+    const params = new URLSearchParams({
+      key: upload.key,
+      uploadId: upload.uploadId,
+      partNumber: String(partNumber),
+    });
     const request = new XMLHttpRequest();
-    request.open("POST", "/api/photos");
+    request.open("PUT", `/api/uploads/part?${params}`);
     request.responseType = "json";
+    request.setRequestHeader("x-upload-token", token);
+    request.setRequestHeader("content-type", "application/octet-stream");
+
+    const removeAbortListener = () =>
+      signal.removeEventListener("abort", abortRequest);
+    const abortRequest = () => request.abort();
 
     request.upload.addEventListener("progress", (event) => {
-      if (event.lengthComputable) onProgress(event.loaded / event.total);
+      onProgress(event.loaded);
     });
-
     request.addEventListener("load", () => {
+      removeAbortListener();
       const body = request.response as
-        | UploadResponse
+        | UploadedPart
         | { error?: string }
         | null;
-      if (request.status >= 200 && request.status < 300 && body && "photo" in body) {
+      if (
+        request.status >= 200 &&
+        request.status < 300 &&
+        body &&
+        "etag" in body
+      ) {
         resolve(body);
         return;
       }
@@ -51,28 +115,81 @@ export function uploadPhoto(
         new Error(
           body && "error" in body && body.error
             ? body.error
-            : `No se pudo subir la fotografía (${request.status}).`,
+            : `No se pudo subir una parte (${request.status}).`,
         ),
       );
     });
-
     request.addEventListener("error", () => {
+      removeAbortListener();
       reject(new Error("Se perdió la conexión durante la subida."));
     });
-
     request.addEventListener("abort", () => {
-      reject(new Error("La subida se canceló."));
+      removeAbortListener();
+      reject(new DOMException("La subida se canceló.", "AbortError"));
     });
 
-    const formData = new FormData();
-    formData.append("photo", file, file.name);
-    request.send(formData);
+    signal.addEventListener("abort", abortRequest, { once: true });
+    if (signal.aborted) {
+      request.abort();
+      return;
+    }
+    request.send(chunk);
   });
 }
 
-export async function deletePhoto(key: string): Promise<void> {
+export function completeMultipartUpload(
+  payload: {
+    key: string;
+    uploadId: string;
+    parts: UploadedPart[];
+  },
+  token: string,
+): Promise<CompleteUploadResponse> {
+  return jsonRequest("/api/uploads/complete", {
+    method: "POST",
+    headers: { "x-upload-token": token },
+    body: JSON.stringify(payload),
+  });
+}
+
+export async function abortMultipartUpload(
+  key: string,
+  uploadId: string,
+  token: string,
+): Promise<void> {
+  const response = await fetch("/api/uploads/abort", {
+    method: "POST",
+    credentials: "same-origin",
+    headers: {
+      "content-type": "application/json",
+      "x-upload-token": token,
+    },
+    body: JSON.stringify({ key, uploadId }),
+  });
+  if (!response.ok) throw new Error(await responseError(response));
+}
+
+export async function uploadPoster(
+  mediaKey: string,
+  poster: Blob,
+  token: string,
+): Promise<void> {
+  const response = await fetch("/api/uploads/poster", {
+    method: "POST",
+    credentials: "same-origin",
+    headers: {
+      "content-type": poster.type || "image/webp",
+      "x-media-key": mediaKey,
+      "x-upload-token": token,
+    },
+    body: poster,
+  });
+  if (!response.ok) throw new Error(await responseError(response));
+}
+
+export async function deleteMedia(key: string): Promise<void> {
   const params = new URLSearchParams({ key });
-  const response = await fetch(`/api/admin/photos?${params}`, {
+  const response = await fetch(`/api/admin/media?${params}`, {
     method: "DELETE",
     credentials: "same-origin",
   });

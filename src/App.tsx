@@ -4,20 +4,71 @@ import {
   type KeyboardEvent,
   useCallback,
   useEffect,
+  useMemo,
   useRef,
   useState,
 } from "react";
-import { deletePhoto, getPhotos, uploadPhoto } from "./api";
-import { compressImage, fileHash, isAcceptedImage } from "./image-processing";
-import type { Photo } from "./types";
+import {
+  abortMultipartUpload,
+  completeMultipartUpload,
+  createMultipartUpload,
+  createUploadSession,
+  deleteMedia,
+  getMedia,
+  uploadPart,
+  uploadPoster,
+} from "./api";
+import {
+  compressImage,
+  createVideoPoster,
+  fileFingerprint,
+  fileSignature,
+  isAcceptedMedia,
+  mediaKind,
+  normalizedMimeType,
+} from "./image-processing";
+import type {
+  MediaItem,
+  MultipartUploadDetails,
+  UploadedPart,
+} from "./types";
 
-const MAX_SELECTION = 20;
-const MAX_FILE_SIZE = 20 * 1024 * 1024;
+const FILE_CONCURRENCY = 2;
+const PART_RETRIES = 3;
 
-function mergePhotos(current: Photo[], incoming: Photo[]): Photo[] {
-  const photos = new Map(current.map((photo) => [photo.id, photo]));
-  incoming.forEach((photo) => photos.set(photo.id, photo));
-  return Array.from(photos.values()).sort(
+type UploadStatus =
+  | "pending"
+  | "preparing"
+  | "uploading"
+  | "completed"
+  | "failed"
+  | "cancelled";
+
+interface UploadJob {
+  id: string;
+  file: File;
+  status: UploadStatus;
+  progress: number;
+  error?: string;
+}
+
+interface ActiveUpload extends MultipartUploadDetails {
+  token: string;
+}
+
+const statusLabels: Record<UploadStatus, string> = {
+  pending: "Pendiente",
+  preparing: "Preparando",
+  uploading: "Subiendo",
+  completed: "Completado",
+  failed: "Fallido",
+  cancelled: "Cancelado",
+};
+
+function mergeMedia(current: MediaItem[], incoming: MediaItem[]): MediaItem[] {
+  const media = new Map(current.map((item) => [item.id, item]));
+  incoming.forEach((item) => media.set(item.id, item));
+  return Array.from(media.values()).sort(
     (left, right) =>
       new Date(right.uploadedAt).getTime() - new Date(left.uploadedAt).getTime(),
   );
@@ -29,9 +80,12 @@ function Header({ admin = false }: { admin?: boolean }) {
       <span className="hero-kicker" aria-hidden="true">
         S · C
       </span>
-      <h1>Santi <span aria-hidden="true">&amp;</span><span className="sr-only">y</span> Claudia</h1>
+      <h1>
+        Santi <span aria-hidden="true">&amp;</span>
+        <span className="sr-only">y</span> Claudia
+      </h1>
       {admin ? (
-        <p className="hero-subtitle">Administración de fotografías</p>
+        <p className="hero-subtitle">Administración de recuerdos</p>
       ) : (
         <div className="hero-subtitle">
           <p>Un día para recordar</p>
@@ -44,126 +98,315 @@ function Header({ admin = false }: { admin?: boolean }) {
 }
 
 interface UploadZoneProps {
-  onUploaded: (photos: Photo[]) => void;
+  onUploaded: (media: MediaItem[]) => void;
+}
+
+function isAbortError(error: unknown): boolean {
+  return error instanceof DOMException && error.name === "AbortError";
+}
+
+function formatProgress(progress: number): string {
+  return `${Math.round(Math.min(100, Math.max(0, progress)))}%`;
 }
 
 function UploadZone({ onUploaded }: UploadZoneProps) {
   const inputRef = useRef<HTMLInputElement>(null);
+  const controllersRef = useRef(new Map<string, AbortController>());
+  const activeUploadsRef = useRef(new Map<string, ActiveUpload>());
+  const cancelledRef = useRef(new Set<string>());
   const [dragging, setDragging] = useState(false);
   const [busy, setBusy] = useState(false);
-  const [progress, setProgress] = useState(0);
-  const [status, setStatus] = useState("");
-  const [errors, setErrors] = useState<string[]>([]);
+  const [jobs, setJobs] = useState<UploadJob[]>([]);
+  const [message, setMessage] = useState("");
+
+  const updateJob = useCallback(
+    (id: string, patch: Partial<Omit<UploadJob, "id" | "file">>) => {
+      setJobs((current) =>
+        current.map((job) => (job.id === id ? { ...job, ...patch } : job)),
+      );
+    },
+    [],
+  );
 
   const chooseFiles = () => {
     if (!busy) inputRef.current?.click();
   };
 
-  const processFiles = async (selection: File[]) => {
-    setErrors([]);
-    setStatus("");
-    setProgress(0);
+  const uploadChunkWithRetries = async (
+    job: UploadJob,
+    upload: ActiveUpload,
+    partNumber: number,
+    chunk: Blob,
+    uploadedBytes: number,
+    totalBytes: number,
+    controller: AbortController,
+  ): Promise<UploadedPart> => {
+    let lastError: unknown;
 
-    if (selection.length === 0) return;
-    if (selection.length > MAX_SELECTION) {
-      setErrors([
-        `Puedes seleccionar un máximo de ${MAX_SELECTION} fotografías cada vez.`,
-      ]);
-      return;
+    for (let attempt = 1; attempt <= PART_RETRIES; attempt += 1) {
+      try {
+        return await uploadPart(
+          upload,
+          partNumber,
+          chunk,
+          upload.token,
+          controller.signal,
+          (loaded) => {
+            updateJob(job.id, {
+              progress: ((uploadedBytes + loaded) / totalBytes) * 100,
+            });
+          },
+        );
+      } catch (error) {
+        if (isAbortError(error) || controller.signal.aborted) throw error;
+        lastError = error;
+        if (attempt < PART_RETRIES) {
+          await new Promise((resolve) =>
+            window.setTimeout(resolve, 450 * 2 ** (attempt - 1)),
+          );
+        }
+      }
     }
 
-    const validationErrors: string[] = [];
-    const validFiles = selection.filter((file) => {
-      if (!isAcceptedImage(file)) {
-        validationErrors.push(`${file.name}: formato no permitido.`);
-        return false;
-      }
-      if (file.size === 0 || file.size > MAX_FILE_SIZE) {
-        validationErrors.push(`${file.name}: supera el límite de 20 MB.`);
-        return false;
-      }
-      return true;
-    });
+    throw lastError instanceof Error
+      ? lastError
+      : new Error("No se pudo subir una parte del archivo.");
+  };
 
-    setErrors(validationErrors);
-    if (validFiles.length === 0) return;
+  const uploadOne = useCallback(
+    async (job: UploadJob, token: string) => {
+      if (cancelledRef.current.has(job.id)) return;
 
-    setBusy(true);
-    setStatus("Preparando tus fotografías…");
-    const uploaded: Photo[] = [];
-    const uploadErrors = [...validationErrors];
-    const selectionHashes = new Set<string>();
-    let duplicates = 0;
-    let newUploads = 0;
+      const controller = new AbortController();
+      controllersRef.current.set(job.id, controller);
+      updateJob(job.id, {
+        status: "preparing",
+        progress: 0,
+        error: undefined,
+      });
 
-    for (let index = 0; index < validFiles.length; index += 1) {
-      const original = validFiles[index];
-      setStatus(`Preparando ${index + 1} de ${validFiles.length}…`);
-      setProgress((index / validFiles.length) * 100);
+      let activeUpload: ActiveUpload | undefined;
 
       try {
-        const hash = await fileHash(original);
-        if (selectionHashes.has(hash)) {
-          duplicates += 1;
-          continue;
+        const kind = mediaKind(job.file);
+        const preparedFile =
+          kind === "image" ? await compressImage(job.file) : job.file;
+        if (controller.signal.aborted) {
+          throw new DOMException("La subida se canceló.", "AbortError");
         }
-        selectionHashes.add(hash);
 
-        const compressed = await compressImage(original);
-        setStatus(`Subiendo ${index + 1} de ${validFiles.length}…`);
-        const result = await uploadPhoto(compressed, (fraction) => {
-          setProgress(((index + fraction) / validFiles.length) * 100);
-        });
+        const posterPromise =
+          kind === "video"
+            ? createVideoPoster(job.file)
+            : Promise.resolve<File | null>(null);
+        const [fingerprint, signature, poster] = await Promise.all([
+          fileFingerprint(preparedFile),
+          fileSignature(preparedFile),
+          posterPromise,
+        ]);
 
-        if (result.duplicate) duplicates += 1;
-        else newUploads += 1;
-        uploaded.push(result.photo);
-      } catch (error) {
-        uploadErrors.push(
-          `${original.name}: ${
-            error instanceof Error ? error.message : "no se pudo subir."
-          }`,
+        const created = await createMultipartUpload(
+          {
+            name: job.file.name,
+            type: normalizedMimeType(preparedFile),
+            size: preparedFile.size,
+            kind,
+            signature,
+            fingerprint,
+          },
+          token,
         );
+
+        if (created.duplicate && created.media) {
+          updateJob(job.id, { status: "completed", progress: 100 });
+          onUploaded([created.media]);
+          return;
+        }
+        if (!created.upload) {
+          throw new Error("No se pudo iniciar la subida.");
+        }
+
+        activeUpload = { ...created.upload, token };
+        activeUploadsRef.current.set(job.id, activeUpload);
+        updateJob(job.id, { status: "uploading", progress: 0 });
+
+        const uploadedParts: UploadedPart[] = [];
+        let uploadedBytes = 0;
+        let partNumber = 1;
+
+        for (
+          let offset = 0;
+          offset < preparedFile.size;
+          offset += activeUpload.partSize
+        ) {
+          if (controller.signal.aborted) {
+            throw new DOMException("La subida se canceló.", "AbortError");
+          }
+          const chunk = preparedFile.slice(
+            offset,
+            Math.min(offset + activeUpload.partSize, preparedFile.size),
+          );
+          const part = await uploadChunkWithRetries(
+            job,
+            activeUpload,
+            partNumber,
+            chunk,
+            uploadedBytes,
+            preparedFile.size,
+            controller,
+          );
+          uploadedParts.push(part);
+          uploadedBytes += chunk.size;
+          updateJob(job.id, {
+            progress: (uploadedBytes / preparedFile.size) * 100,
+          });
+          partNumber += 1;
+        }
+
+        const completed = await completeMultipartUpload(
+          {
+            key: activeUpload.key,
+            uploadId: activeUpload.uploadId,
+            parts: uploadedParts,
+          },
+          token,
+        );
+        activeUploadsRef.current.delete(job.id);
+
+        if (poster && completed.media.kind === "video") {
+          await uploadPoster(completed.media.key, poster, token).catch(() => {
+            // The video remains usable with the elegant fallback thumbnail.
+          });
+        }
+
+        updateJob(job.id, { status: "completed", progress: 100 });
+        onUploaded([completed.media]);
+      } catch (error) {
+        if (activeUpload) {
+          await abortMultipartUpload(
+            activeUpload.key,
+            activeUpload.uploadId,
+            activeUpload.token,
+          ).catch(() => {
+            // R2 also aborts abandoned multipart uploads automatically.
+          });
+          activeUploadsRef.current.delete(job.id);
+        }
+
+        if (isAbortError(error) || controller.signal.aborted) {
+          updateJob(job.id, {
+            status: "cancelled",
+            error: "Subida cancelada.",
+          });
+        } else {
+          updateJob(job.id, {
+            status: "failed",
+            error:
+              error instanceof Error
+                ? error.message
+                : "No se pudo subir el archivo.",
+          });
+        }
       } finally {
-        setProgress(((index + 1) / validFiles.length) * 100);
+        controllersRef.current.delete(job.id);
       }
+    },
+    [onUploaded, updateJob],
+  );
+
+  const runQueue = useCallback(
+    async (queue: UploadJob[], token: string) => {
+      let nextIndex = 0;
+      const workers = Array.from(
+        { length: Math.min(FILE_CONCURRENCY, queue.length) },
+        async () => {
+          while (nextIndex < queue.length) {
+            const job = queue[nextIndex];
+            nextIndex += 1;
+            if (job && !cancelledRef.current.has(job.id)) {
+              await uploadOne(job, token);
+            }
+          }
+        },
+      );
+      await Promise.all(workers);
+    },
+    [uploadOne],
+  );
+
+  const processFiles = async (selection: File[]) => {
+    if (selection.length === 0) return;
+
+    setMessage("");
+    cancelledRef.current.clear();
+    const nextJobs = selection.map<UploadJob>((file) => ({
+      id: crypto.randomUUID(),
+      file,
+      status:
+        file.size > 0 && isAcceptedMedia(file) ? "pending" : "failed",
+      progress: 0,
+      error:
+        file.size === 0
+          ? "El archivo está vacío."
+          : isAcceptedMedia(file)
+            ? undefined
+            : "El formato no es una imagen o un vídeo compatible.",
+    }));
+    setJobs(nextJobs);
+
+    const queue = nextJobs.filter((job) => job.status === "pending");
+    if (queue.length === 0) return;
+
+    setBusy(true);
+    setMessage("Preparando tus recuerdos…");
+    try {
+      const session = await createUploadSession();
+      await runQueue(queue, session.token);
+      setMessage("Proceso terminado. Tus recuerdos ya están en la galería.");
+    } catch (error) {
+      const description =
+        error instanceof Error
+          ? error.message
+          : "No se pudo iniciar la subida.";
+      queue.forEach((job) => {
+        updateJob(job.id, { status: "failed", error: description });
+      });
+      setMessage("No se ha podido iniciar la subida.");
+    } finally {
+      setBusy(false);
+      if (inputRef.current) inputRef.current.value = "";
     }
+  };
 
-    if (uploaded.length > 0) onUploaded(uploaded);
-    setErrors(uploadErrors);
-
-    if (uploadErrors.length === 0 && newUploads > 0) {
-      setStatus(
-        `¡Listo! ${newUploads} ${
-          newUploads === 1 ? "foto compartida" : "fotos compartidas"
-        }.${
-          duplicates > 0
-            ? ` ${duplicates} ya ${
-                duplicates === 1 ? "estaba" : "estaban"
-              } en la galería.`
-            : ""
-        }`,
-      );
-    } else if (uploadErrors.length === 0 && duplicates > 0) {
-      setStatus(
-        `¡Listo! ${duplicates === 1 ? "Esa foto ya estaba" : "Esas fotos ya estaban"} en la galería.`,
-      );
-    } else if (uploaded.length > 0 || duplicates > 0) {
-      setStatus(
-        `Proceso terminado${
-          newUploads > 0
-            ? `: ${newUploads} ${
-                newUploads === 1 ? "foto se ha subido" : "fotos se han subido"
-              }`
-            : ""
-        }. Revisa los avisos de abajo.`,
-      );
-    } else {
-      setStatus("No se ha podido subir ninguna fotografía.");
+  const retryJob = async (job: UploadJob) => {
+    cancelledRef.current.delete(job.id);
+    setBusy(true);
+    setMessage("Reintentando el archivo…");
+    try {
+      const session = await createUploadSession();
+      await uploadOne(job, session.token);
+      setMessage("Reintento terminado.");
+    } catch (error) {
+      updateJob(job.id, {
+        status: "failed",
+        error:
+          error instanceof Error ? error.message : "No se pudo reintentar.",
+      });
+    } finally {
+      setBusy(false);
     }
+  };
 
-    setBusy(false);
-    if (inputRef.current) inputRef.current.value = "";
+  const cancelJob = (job: UploadJob) => {
+    cancelledRef.current.add(job.id);
+    const controller = controllersRef.current.get(job.id);
+    controller?.abort();
+    if (!controller) {
+      updateJob(job.id, {
+        status: "cancelled",
+        error: "Subida cancelada.",
+      });
+    }
   };
 
   const onInputChange = (event: ChangeEvent<HTMLInputElement>) => {
@@ -183,11 +426,24 @@ function UploadZone({ onUploaded }: UploadZoneProps) {
     }
   };
 
+  const globalProgress = useMemo(() => {
+    if (jobs.length === 0) return 0;
+    const total = jobs.reduce((sum, job) => {
+      if (job.status === "completed") return sum + 100;
+      if (job.status === "failed" || job.status === "cancelled") {
+        return sum + job.progress;
+      }
+      return sum + job.progress;
+    }, 0);
+    return total / jobs.length;
+  }, [jobs]);
+
   return (
     <section className="upload-section" aria-labelledby="share-title">
       <div className="section-heading">
-        <h2 id="share-title">Comparte tus fotos de este día</h2>
-        <p lang="it">Condividi le foto di questa giornata</p>
+        <p className="section-eyebrow">Comparte tus recuerdos de este día</p>
+        <h2 id="share-title">Sube tus fotos y vídeos</h2>
+        <p lang="it">Carica le tue foto e i tuoi video</p>
       </div>
 
       <div
@@ -215,7 +471,7 @@ function UploadZone({ onUploaded }: UploadZoneProps) {
           ref={inputRef}
           className="sr-only"
           type="file"
-          accept="image/jpeg,image/png,image/webp,image/heic,image/heif,.heic,.heif"
+          accept="image/jpeg,image/png,image/webp,image/heic,image/heif,video/mp4,video/quicktime,video/x-m4v,video/webm,.heic,.heif,.mov,.m4v"
           multiple
           onChange={onInputChange}
           disabled={busy}
@@ -225,76 +481,154 @@ function UploadZone({ onUploaded }: UploadZoneProps) {
           <span />
         </span>
         <span className="upload-button-text">
-          Sube tus fotos <span aria-hidden="true">·</span>{" "}
-          <span lang="it">Carica le tue foto</span>
+          Sube tus fotos y vídeos <span aria-hidden="true">·</span>{" "}
+          <span lang="it">Carica le tue foto e i tuoi video</span>
         </span>
         <span className="upload-hint">
-          Pulsa para elegir o arrastra aquí
+          Pulsa para elegir o arrastra tus archivos aquí
         </span>
-        <span className="upload-limits">Hasta 20 fotos · 20 MB por foto</span>
       </div>
 
-      {(busy || status) && (
-        <div className="upload-feedback" aria-live="polite">
+      {jobs.length > 0 && (
+        <div className="upload-queue" aria-live="polite">
+          <div className="queue-summary">
+            <span>Progreso de la selección</span>
+            <strong>{formatProgress(globalProgress)}</strong>
+          </div>
           <div
             className="progress-track"
             role="progressbar"
-            aria-label="Progreso de subida"
+            aria-label="Progreso total de la selección"
             aria-valuemin={0}
             aria-valuemax={100}
-            aria-valuenow={Math.round(progress)}
+            aria-valuenow={Math.round(globalProgress)}
           >
-            <span style={{ width: `${progress}%` }} />
+            <span style={{ width: formatProgress(globalProgress) }} />
           </div>
-          <p className={busy ? "" : "success-message"}>{status}</p>
-        </div>
-      )}
 
-      {errors.length > 0 && (
-        <div className="error-list" role="alert">
-          {errors.map((error, index) => (
-            <p key={`${error}-${index}`}>{error}</p>
-          ))}
+          <div className="queue-list">
+            {jobs.map((job) => (
+              <article className={`queue-item is-${job.status}`} key={job.id}>
+                <div className="queue-item-main">
+                  <span className="queue-kind" aria-hidden="true">
+                    {mediaKind(job.file) === "video" ? "▶" : "◇"}
+                  </span>
+                  <div className="queue-copy">
+                    <strong>{job.file.name}</strong>
+                    <span>
+                      {statusLabels[job.status]} · {formatProgress(job.progress)}
+                    </span>
+                    {job.error && <small>{job.error}</small>}
+                  </div>
+                </div>
+                <div className="queue-actions">
+                  {(job.status === "pending" ||
+                    job.status === "preparing" ||
+                    job.status === "uploading") && (
+                    <button
+                      type="button"
+                      onClick={(event) => {
+                        event.stopPropagation();
+                        cancelJob(job);
+                      }}
+                    >
+                      Cancelar
+                    </button>
+                  )}
+                  {(job.status === "failed" ||
+                    job.status === "cancelled") && (
+                    <button
+                      type="button"
+                      onClick={(event) => {
+                        event.stopPropagation();
+                        void retryJob(job);
+                      }}
+                      disabled={busy}
+                    >
+                      Reintentar
+                    </button>
+                  )}
+                </div>
+                <span
+                  className="queue-item-progress"
+                  style={{ width: formatProgress(job.progress) }}
+                  aria-hidden="true"
+                />
+              </article>
+            ))}
+          </div>
+          {message && <p className="queue-message">{message}</p>}
         </div>
       )}
     </section>
   );
 }
 
-function PhotoTile({
-  photo,
+function MediaTile({
+  item,
   admin,
   onOpen,
   onDelete,
 }: {
-  photo: Photo;
+  item: MediaItem;
   admin: boolean;
-  onOpen: (photo: Photo) => void;
-  onDelete?: (photo: Photo) => void;
+  onOpen: (item: MediaItem) => void;
+  onDelete?: (item: MediaItem) => void;
 }) {
   const [loaded, setLoaded] = useState(false);
+  const [posterAvailable, setPosterAvailable] = useState(Boolean(item.posterUrl));
+  const isVideo = item.kind === "video";
 
   return (
-    <article className={`photo-card${loaded ? " is-loaded" : ""}`}>
+    <article
+      className={`media-card${loaded ? " is-loaded" : ""}${
+        isVideo ? " is-video" : ""
+      }`}
+    >
       <button
         type="button"
-        className="photo-open"
-        onClick={() => onOpen(photo)}
-        aria-label="Abrir fotografía en grande"
+        className="media-open"
+        onClick={() => onOpen(item)}
+        aria-label={isVideo ? "Abrir vídeo" : "Abrir fotografía en grande"}
       >
-        <img
-          src={photo.url}
-          alt=""
-          loading="lazy"
-          decoding="async"
-          onLoad={() => setLoaded(true)}
-        />
+        {isVideo ? (
+          posterAvailable && item.posterUrl ? (
+            <img
+              src={item.posterUrl}
+              alt=""
+              loading="lazy"
+              decoding="async"
+              onLoad={() => setLoaded(true)}
+              onError={() => {
+                setPosterAvailable(false);
+                setLoaded(true);
+              }}
+            />
+          ) : (
+            <span className="video-fallback" aria-hidden="true">
+              <span>▶</span>
+            </span>
+          )
+        ) : (
+          <img
+            src={item.url}
+            alt=""
+            loading="lazy"
+            decoding="async"
+            onLoad={() => setLoaded(true)}
+          />
+        )}
+        {isVideo && (
+          <span className="play-badge" aria-hidden="true">
+            ▶
+          </span>
+        )}
       </button>
       {admin && onDelete && (
         <button
           type="button"
-          className="delete-photo"
-          onClick={() => onDelete(photo)}
+          className="delete-media"
+          onClick={() => onDelete(item)}
         >
           Eliminar
         </button>
@@ -304,33 +638,43 @@ function PhotoTile({
 }
 
 function Lightbox({
-  photo,
+  item,
+  hasPrevious,
+  hasNext,
+  onPrevious,
+  onNext,
   onClose,
 }: {
-  photo: Photo | null;
+  item: MediaItem | null;
+  hasPrevious: boolean;
+  hasNext: boolean;
+  onPrevious: () => void;
+  onNext: () => void;
   onClose: () => void;
 }) {
   useEffect(() => {
-    if (!photo) return;
-    const closeOnEscape = (event: globalThis.KeyboardEvent) => {
+    if (!item) return;
+    const onKey = (event: globalThis.KeyboardEvent) => {
       if (event.key === "Escape") onClose();
+      if (event.key === "ArrowLeft" && hasPrevious) onPrevious();
+      if (event.key === "ArrowRight" && hasNext) onNext();
     };
-    document.addEventListener("keydown", closeOnEscape);
+    document.addEventListener("keydown", onKey);
     document.body.classList.add("no-scroll");
     return () => {
-      document.removeEventListener("keydown", closeOnEscape);
+      document.removeEventListener("keydown", onKey);
       document.body.classList.remove("no-scroll");
     };
-  }, [photo, onClose]);
+  }, [hasNext, hasPrevious, item, onClose, onNext, onPrevious]);
 
-  if (!photo) return null;
+  if (!item) return null;
 
   return (
     <div
       className="lightbox"
       role="dialog"
       aria-modal="true"
-      aria-label="Fotografía ampliada"
+      aria-label={item.kind === "video" ? "Vídeo ampliado" : "Fotografía ampliada"}
       onMouseDown={(event) => {
         if (event.target === event.currentTarget) onClose();
       }}
@@ -339,38 +683,71 @@ function Lightbox({
         type="button"
         className="lightbox-close"
         onClick={onClose}
-        aria-label="Cerrar fotografía"
+        aria-label="Cerrar visor"
         autoFocus
       >
         ×
       </button>
-      <img src={photo.url} alt="" />
+      {hasPrevious && (
+        <button
+          type="button"
+          className="lightbox-nav is-previous"
+          onClick={onPrevious}
+          aria-label="Recuerdo anterior"
+        >
+          ‹
+        </button>
+      )}
+      {item.kind === "video" ? (
+        <video
+          key={item.id}
+          src={item.url}
+          poster={item.posterUrl}
+          controls
+          playsInline
+          preload="metadata"
+        />
+      ) : (
+        <img key={item.id} src={item.url} alt="" />
+      )}
+      {hasNext && (
+        <button
+          type="button"
+          className="lightbox-nav is-next"
+          onClick={onNext}
+          aria-label="Recuerdo siguiente"
+        >
+          ›
+        </button>
+      )}
     </div>
   );
 }
 
 function Gallery({
-  incomingPhotos,
+  incomingMedia,
   admin = false,
 }: {
-  incomingPhotos: Photo[];
+  incomingMedia: MediaItem[];
   admin?: boolean;
 }) {
-  const [photos, setPhotos] = useState<Photo[]>([]);
+  const [media, setMedia] = useState<MediaItem[]>([]);
   const [cursor, setCursor] = useState<string | null>(null);
   const [loading, setLoading] = useState(true);
   const [loadingMore, setLoadingMore] = useState(false);
   const [error, setError] = useState("");
-  const [selected, setSelected] = useState<Photo | null>(null);
+  const [selectedId, setSelectedId] = useState<string | null>(null);
   const sentinelRef = useRef<HTMLDivElement>(null);
+  const selectedIndex = media.findIndex((item) => item.id === selectedId);
+  const selected = selectedIndex >= 0 ? media[selectedIndex] : null;
 
   useEffect(() => {
     let active = true;
     setLoading(true);
-    getPhotos(undefined, admin)
+    getMedia(undefined, admin)
       .then((result) => {
         if (!active) return;
-        setPhotos(result.photos);
+        setMedia(result.media);
         setCursor(result.cursor);
         setError("");
       })
@@ -391,17 +768,17 @@ function Gallery({
   }, [admin]);
 
   useEffect(() => {
-    if (incomingPhotos.length > 0) {
-      setPhotos((current) => mergePhotos(current, incomingPhotos));
+    if (incomingMedia.length > 0) {
+      setMedia((current) => mergeMedia(current, incomingMedia));
     }
-  }, [incomingPhotos]);
+  }, [incomingMedia]);
 
   useEffect(() => {
     if (admin) return;
     const interval = window.setInterval(() => {
-      getPhotos()
+      getMedia()
         .then((result) => {
-          setPhotos((current) => mergePhotos(current, result.photos));
+          setMedia((current) => mergeMedia(current, result.media));
         })
         .catch(() => {
           // A temporary polling error should not replace the visible gallery.
@@ -414,14 +791,14 @@ function Gallery({
     if (!cursor || loadingMore) return;
     setLoadingMore(true);
     try {
-      const result = await getPhotos(cursor, admin);
-      setPhotos((current) => mergePhotos(current, result.photos));
+      const result = await getMedia(cursor, admin);
+      setMedia((current) => mergeMedia(current, result.media));
       setCursor(result.cursor);
     } catch (cause) {
       setError(
         cause instanceof Error
           ? cause.message
-          : "No se pudieron cargar más fotografías.",
+          : "No se pudieron cargar más recuerdos.",
       );
     } finally {
       setLoadingMore(false);
@@ -441,26 +818,39 @@ function Gallery({
     return () => observer.disconnect();
   }, [cursor, loadMore]);
 
-  const removePhoto = async (photo: Photo) => {
-    if (!window.confirm("¿Eliminar esta fotografía definitivamente?")) return;
+  const removeItem = async (item: MediaItem) => {
+    const label = item.kind === "video" ? "este vídeo" : "esta fotografía";
+    if (!window.confirm(`¿Eliminar ${label} definitivamente?`)) return;
     try {
-      await deletePhoto(photo.key);
-      setPhotos((current) => current.filter((item) => item.id !== photo.id));
-      if (selected?.id === photo.id) setSelected(null);
+      await deleteMedia(item.key);
+      setMedia((current) => current.filter((entry) => entry.id !== item.id));
+      if (selectedId === item.id) setSelectedId(null);
     } catch (cause) {
       setError(
         cause instanceof Error
           ? cause.message
-          : "No se pudo eliminar la fotografía.",
+          : "No se pudo eliminar el recuerdo.",
       );
     }
   };
+
+  const showPrevious = useCallback(() => {
+    if (selectedIndex > 0) setSelectedId(media[selectedIndex - 1]?.id ?? null);
+  }, [media, selectedIndex]);
+
+  const showNext = useCallback(() => {
+    if (selectedIndex >= 0 && selectedIndex < media.length - 1) {
+      setSelectedId(media[selectedIndex + 1]?.id ?? null);
+    }
+  }, [media, selectedIndex]);
 
   return (
     <section className="gallery-section" aria-labelledby="gallery-title">
       <div className="gallery-heading">
         <span aria-hidden="true" />
-        <h2 id="gallery-title">{admin ? "Fotografías subidas" : "Recuerdos compartidos"}</h2>
+        <h2 id="gallery-title">
+          {admin ? "Recuerdos subidos" : "Recuerdos compartidos"}
+        </h2>
         <span aria-hidden="true" />
       </div>
 
@@ -471,30 +861,30 @@ function Gallery({
       )}
 
       {loading ? (
-        <div className="gallery-loading" aria-label="Cargando fotografías">
+        <div className="gallery-loading" aria-label="Cargando recuerdos">
           <span />
           <span />
           <span />
           <span />
         </div>
-      ) : photos.length === 0 ? (
+      ) : media.length === 0 ? (
         <div className="empty-gallery">
-          <span aria-hidden="true">◇</span>
+          <span aria-hidden="true">❧</span>
           <p>
             {admin
-              ? "Todavía no se ha subido ninguna fotografía."
+              ? "Todavía no se ha compartido ningún recuerdo."
               : "Sé la primera persona en compartir un recuerdo."}
           </p>
         </div>
       ) : (
-        <div className="photo-grid">
-          {photos.map((photo) => (
-            <PhotoTile
-              key={photo.id}
-              photo={photo}
+        <div className="media-grid">
+          {media.map((item) => (
+            <MediaTile
+              key={item.id}
+              item={item}
               admin={admin}
-              onOpen={setSelected}
-              onDelete={admin ? removePhoto : undefined}
+              onOpen={(entry) => setSelectedId(entry.id)}
+              onDelete={admin ? removeItem : undefined}
             />
           ))}
         </div>
@@ -502,24 +892,31 @@ function Gallery({
 
       <div ref={sentinelRef} className="gallery-sentinel" aria-hidden="true" />
       {loadingMore && <p className="loading-more">Cargando más…</p>}
-      <Lightbox photo={selected} onClose={() => setSelected(null)} />
+      <Lightbox
+        item={selected}
+        hasPrevious={selectedIndex > 0}
+        hasNext={selectedIndex >= 0 && selectedIndex < media.length - 1}
+        onPrevious={showPrevious}
+        onNext={showNext}
+        onClose={() => setSelectedId(null)}
+      />
     </section>
   );
 }
 
 function PublicPage() {
-  const [incomingPhotos, setIncomingPhotos] = useState<Photo[]>([]);
+  const [incomingMedia, setIncomingMedia] = useState<MediaItem[]>([]);
 
   return (
     <main>
       <div className="page-shell">
         <Header />
         <UploadZone
-          onUploaded={(photos) => {
-            setIncomingPhotos((current) => mergePhotos(current, photos));
+          onUploaded={(media) => {
+            setIncomingMedia((current) => mergeMedia(current, media));
           }}
         />
-        <Gallery incomingPhotos={incomingPhotos} />
+        <Gallery incomingMedia={incomingMedia} />
       </div>
     </main>
   );
@@ -533,7 +930,7 @@ function AdminPage() {
         <a className="back-link" href="/">
           Volver a la galería
         </a>
-        <Gallery incomingPhotos={[]} admin />
+        <Gallery incomingMedia={[]} admin />
       </div>
     </main>
   );
